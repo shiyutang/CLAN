@@ -23,7 +23,7 @@ from dataset.cityscapes_dataset import cityscapesDataSet
 IMG_MEAN = np.array((104.00698793, 116.66876762, 122.67891434), dtype=np.float32)
 
 MODEL = 'ResNet'
-BATCH_SIZE = 4
+BATCH_SIZE = 1
 ITER_SIZE = 1
 NUM_WORKERS = 4
 
@@ -158,8 +158,8 @@ def loss_calc(pred, label, gpu):
     """
     # out shape batch_size x channels x h x w -> batch_size x channels x h x w
     # label shape h x w x 1 x batch_size  -> batch_size x 1 x h x w
-    label = Variable(label.long()).cuda(gpu)
-    criterion = CrossEntropy2d(NUM_CLASSES).cuda(gpu)
+    label = Variable(label.long()).cuda()
+    criterion = CrossEntropy2d(NUM_CLASSES).cuda()
     return criterion(pred, label)
 
 
@@ -207,14 +207,13 @@ def main():
     input_size_target = (h, w)
 
     cudnn.enabled = True
+    print("torch.cuda.device_count()",torch.cuda.device_count())
     
     # Create Network
     model = Res_Deeplab(num_classes=args.num_classes)
     if args.restore_from[:4] == 'http' :
         saved_state_dict = model_zoo.load_url(args.restore_from)
-        saved_state_dict = model_zoo.load_url(args.restore_from)
     else:
-        print("retore from {}".format(args.restore_from))
         saved_state_dict = torch.load(args.restore_from)
     new_params = model.state_dict().copy()
     for i in saved_state_dict:
@@ -228,9 +227,8 @@ def main():
         model.load_state_dict(saved_state_dict)
 
     model.train()
-    model = nn.DataParallel(model,device_ids=[0,1,2,3])
+    model = nn.DataParallel(model)
 
-    # model.cuda(args.gpu)
     model.cuda()
 
     cudnn.benchmark = True
@@ -242,8 +240,9 @@ def main():
 #    saved_state_dict_D = torch.load(RESTORE_FROM_D)
 #    model_D.load_state_dict(saved_state_dict_D)
 # =============================================================================
+
     model_D.train()
-    # model_D.cuda(args.gpu)
+    model_D = nn.DataParallel(model_D)
     model_D.cuda()
 
     if not os.path.exists(args.snapshot_dir):
@@ -279,7 +278,7 @@ def main():
                           lr=args.learning_rate, momentum=args.momentum, weight_decay=args.weight_decay)
     optimizer.zero_grad()
 
-    optimizer_D = optim.Adam(model_D.parameters(), lr=args.learning_rate_D, betas=(0.9, 0.99))
+    optimizer_D = optim.Adam(model_D.module.parameters(), lr=args.learning_rate_D, betas=(0.9, 0.99))
     optimizer_D.zero_grad()
 
     bce_loss = torch.nn.BCEWithLogitsLoss()
@@ -313,7 +312,9 @@ def main():
         # Train with Source
         _, batch = next(trainloader_iter)
         images_s, labels_s, _, _, _ = batch
-        images_s = Variable(images_s).cuda(args.gpu)
+
+        images_s = Variable(images_s).cuda()
+        labels_s = labels_s.cuda()
         pred_source1, pred_source2 = model(images_s)
         pred_source1 = interp_source(pred_source1)
         pred_source2 = interp_source(pred_source2)
@@ -325,7 +326,7 @@ def main():
         # Train with Target
         _, batch = next(targetloader_iter)
         images_t, _, _, _ = batch
-        images_t = Variable(images_t).cuda(args.gpu)
+        images_t = Variable(images_t).cuda()
         
         pred_target1, pred_target2 = model(images_t)
         pred_target1 = interp_target(pred_target1)
@@ -339,10 +340,10 @@ def main():
         if(i_iter > PREHEAT_STEPS):
             loss_adv = weighted_bce_loss(D_out, 
                                     Variable(torch.FloatTensor(D_out.data.size()).fill_(source_label)).cuda(
-                                        args.gpu), weight_map, Epsilon, Lambda_local)
+                                        ), weight_map, Epsilon, Lambda_local)
         else:
             loss_adv = bce_loss(D_out,
-                          Variable(torch.FloatTensor(D_out.data.size()).fill_(source_label)).cuda(args.gpu))
+                          Variable(torch.FloatTensor(D_out.data.size()).fill_(source_label)).cuda())
 
         loss_adv = loss_adv * Lambda_adv * damping
         loss_adv.backward()
@@ -379,7 +380,7 @@ def main():
         D_out_s = interp_source(model_D(F.softmax(pred_source1 + pred_source2, dim = 1)))
 
         loss_D_s = bce_loss(D_out_s,
-                          Variable(torch.FloatTensor(D_out_s.data.size()).fill_(source_label)).cuda(args.gpu))
+                          Variable(torch.FloatTensor(D_out_s.data.size()).fill_(source_label)).cuda())
 
         loss_D_s.backward()
 
@@ -394,20 +395,21 @@ def main():
         if(i_iter > PREHEAT_STEPS):
             loss_D_t = weighted_bce_loss(D_out_t, 
                                     Variable(torch.FloatTensor(D_out_t.data.size()).fill_(target_label)).cuda(
-                                        args.gpu), weight_map, Epsilon, Lambda_local)
+                                        ), weight_map, Epsilon, Lambda_local)
         else:
             loss_D_t = bce_loss(D_out_t,
-                          Variable(torch.FloatTensor(D_out_t.data.size()).fill_(target_label)).cuda(args.gpu))
+                          Variable(torch.FloatTensor(D_out_t.data.size()).fill_(target_label)).cuda())
             
         loss_D_t.backward()
 
         optimizer.step()
         optimizer_D.step()
 
-        print('exp = {}'.format(args.snapshot_dir))
-        print(
-        'iter = {0:6d}/{1:6d}, loss_seg = {2:.4f} loss_adv = {3:.4f}, loss_weight = {4:.4f}, loss_D_s = {5:.4f} loss_D_t = {6:.4f}'.format(
-            i_iter, args.num_steps, loss_seg, loss_adv, loss_weight, loss_D_s, loss_D_t))
+        if i_iter%100==0:
+            print('exp = {}'.format(args.snapshot_dir))
+            print(
+            'iter = {0:6d}/{1:6d}, loss_seg = {2:.4f} loss_adv = {3:.4f}, loss_weight = {4:.4f}, loss_D_s = {5:.4f} loss_D_t = {6:.4f}'.format(
+                i_iter, args.num_steps, loss_seg, loss_adv, loss_weight, loss_D_s, loss_D_t))
 
         f_loss = open(osp.join(args.snapshot_dir,'loss.txt'), 'a')
         f_loss.write('{0:.4f} {1:.4f} {2:.4f} {3:.4f} {4:.4f}\n'.format(
